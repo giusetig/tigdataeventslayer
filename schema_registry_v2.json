@@ -1,0 +1,690 @@
+{
+  "schema_registry": {
+    "version": "2.0",
+    "domain": "TigDataEvents",
+    "description": "Gestione eventi, registrazioni e utenti per piattaforme LiveForum",
+    "last_updated": "2026-05-22",
+    "changelog": {
+      "2.0": "Aggiornamento post-analisi LiveForum_Netcomm_26 del 22 maggio 2026. Allineamento schema teorico con struttura reale del DB. Aggiunta entità Workshop, Order, Ticket, SponsorLevel, UserInvitation, PromotionCode. Correzione Sponsor e User. Rinomina Sessione in Workshop."
+    },
+    "external_systems": {
+      "mTicket": {
+        "description": "Piattaforma di ticketing esterna",
+        "integration_point": "ProductId in PromotionType, IdFiera in CodiciSconto",
+        "note": "IdFiera corrisponde a EventoId nel nuovo schema. Valore Netcomm_26: 229 (configurato in Web.config come IdFieraMTicket)"
+      },
+      "MICO": {
+        "description": "Sistema esterno di networking/matchmaking tra aziende",
+        "integration_point": "UsernameMico e PasswordMico in Sponsor",
+        "note": "TODO T14: verificare se MICO è ancora attivo e cosa fa esattamente"
+      },
+      "FatturazioneElettronica": {
+        "description": "Sistema esterno di fatturazione elettronica SDI",
+        "integration_point": "InvoiceUID e InvoiceErrors in Order",
+        "note": "Progetto separato che comunica con il DB tramite questi campi"
+      },
+      "GoogleAds": {
+        "description": "Piattaforma advertising Google",
+        "integration_point": "Servizio Tracker, account identificato da ExternalId (es. 797-174-4254 per Netcomm_26)",
+        "note": "LoginCustomerId = 7971744254 configurato in Tracker.exe.config"
+      },
+      "FacebookAds": {
+        "description": "Piattaforma advertising Meta/Facebook",
+        "integration_point": "Servizio Tracker, account act_237789896626275",
+        "note": "TODO T11: Enrico deve completare Data Use Checkup su app Meta 693451887484215"
+      }
+    },
+    "databases": {
+      "primary": {
+        "type": "sqlserver",
+        "name": "TigDataEvents",
+        "instance": "tigevents-sqlmi.98086c461ef2.database.windows.net",
+        "description": "Database principale su Azure SQL Managed Instance"
+      },
+      "cache": {
+        "type": "redis",
+        "description": "Cache per dati ad alta lettura",
+        "ttl_strategy": {
+          "description": "TTL dinamico basato sulla distanza dalla data evento",
+          "rules": [
+            { "condition": "days_to_event > 14", "ttl_seconds": 3600, "label": "Fase early" },
+            { "condition": "days_to_event BETWEEN 3 AND 14", "ttl_seconds": 900, "label": "Fase intermedia" },
+            { "condition": "days_to_event BETWEEN 0 AND 3", "ttl_seconds": 60, "label": "Fase finale" },
+            { "condition": "event_day", "ttl_seconds": 0, "label": "Durante evento - real time" }
+          ]
+        }
+      }
+    },
+    "entities": {
+      "User": {
+        "description": "Utente della piattaforma. Anagrafica unica cross-evento.",
+        "table": "dbo.User",
+        "primary_key": "UserId",
+        "source_table": "LiveForum.dbo.User",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "user:{UserId}",
+          "ttl_seconds": 1800,
+          "invalidate_on": ["update", "delete"]
+        },
+        "fields": {
+          "UserId": { "type": "int", "readonly": true },
+          "Username": { "type": "string", "required": true },
+          "Email": { "type": "string", "required": true, "unique": true },
+          "ReferenceEmail": { "type": "string", "nullable": true },
+          "Password": { "type": "string", "required": true, "note": "Hash" },
+          "Enabled": { "type": "bool", "default": false },
+          "Firstname": { "type": "string" },
+          "Lastname": { "type": "string" },
+          "CompanyName": { "type": "string" },
+          "CleanCompanyName": { "type": "string", "note": "Versione normalizzata di CompanyName" },
+          "Phone": { "type": "string" },
+          "Mobile": { "type": "string" },
+          "CultureId": { "type": "int", "foreign_key": "Culture.CultureId" },
+          "CustomData": {
+            "type": "nvarchar(max)",
+            "note": "In LiveForum era XML. Nel nuovo schema è JSON. TODO T12: aggiornare codice di serializzazione nell'applicazione."
+          },
+          "UID": { "type": "guid", "unique": true, "note": "Usato nei link invitation per precompilare onboarding" },
+          "QRCode": {
+            "type": "string",
+            "note": "Attualmente sull'utente. TODO T13: spostare su Registrazione in futuro quando si ritocca il codice applicativo."
+          },
+          "PrivacyAccepted": { "type": "bool", "required": true },
+          "ThirdPartyPrivacy": { "type": "bool" },
+          "TigDataEventsId": { "type": "guid", "deprecated": true, "note": "SCARTATO: non serve nel sistema unificato" },
+          "IsOnline": { "type": "bool" },
+          "IsOnSite": { "type": "bool" },
+          "LastLogin": { "type": "datetime", "nullable": true },
+          "Registered": { "type": "bool" },
+          "MailReminderSent": { "type": "bool" }
+        },
+        "rules": [
+          {
+            "id": "USR001",
+            "type": "delete_constraint",
+            "description": "Un utente non può essere eliminato se ha registrazioni attive",
+            "condition": "NOT EXISTS (SELECT 1 FROM Registrazione WHERE UserId = @UserId AND Stato = 'ATTIVA')",
+            "error_message": "Impossibile eliminare: l'utente ha registrazioni attive"
+          },
+          {
+            "id": "USR002",
+            "type": "unique_constraint",
+            "description": "Email unica su tutto il sistema",
+            "fields": ["Email"],
+            "error_message": "Email già registrata nel sistema"
+          },
+          {
+            "id": "USR003",
+            "type": "insert_rule",
+            "description": "Alla creazione l'utente è disabilitato finché non completa l'onboarding",
+            "action": "SET Enabled = false"
+          },
+          {
+            "id": "USR004",
+            "type": "migration_note",
+            "description": "CustomData: in migrazione convertire XML esistente in JSON con script SQL"
+          }
+        ],
+        "intents": {
+          "get_by_email": "Recupera utente per email",
+          "get_by_event": "Recupera tutti gli utenti registrati a un evento",
+          "get_by_invitation_uid": "Recupera dati parziali tramite UID per precompilare onboarding",
+          "search": "Ricerca per nome, cognome o azienda",
+          "enable": "Abilita utente dopo completamento onboarding",
+          "disable": "Disabilita utente"
+        }
+      },
+      "UserPhoto": {
+        "description": "Foto profilo dell'utente, opzionale",
+        "table": "dbo.UserPicture",
+        "primary_key": "UserId",
+        "note": "Nel LiveForum la tabella si chiama UserPicture, non UserPhoto",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "user_photo:{UserId}",
+          "ttl_seconds": 7200,
+          "invalidate_on": ["update", "delete"]
+        },
+        "fields": {
+          "UserId": { "type": "int", "required": true, "foreign_key": "User.UserId" },
+          "Picture": { "type": "image", "required": true },
+          "FileType": { "type": "string", "values": ["jpg", "png", "gif", "webp"] }
+        },
+        "rules": [
+          {
+            "id": "PHO001",
+            "type": "format_constraint",
+            "description": "Formato immagine rilevato dai magic bytes",
+            "supported_formats": ["jpg", "png", "gif", "webp"],
+            "error_message": "Formato immagine non supportato"
+          }
+        ],
+        "intents": {
+          "upload": "Carica o aggiorna la foto profilo",
+          "delete": "Rimuove la foto profilo",
+          "get": "Recupera la foto profilo di un utente"
+        }
+      },
+      "LogoConfiguration": {
+        "description": "Configurazione dimensioni logo per i livelli sponsor. Tabella di lookup statica.",
+        "table": "dbo.LogoConfiguration",
+        "primary_key": "LogoConfigurationId",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "logo_configurations",
+          "ttl_seconds": 86400,
+          "comment": "Dato statico, TTL 24 ore"
+        },
+        "fields": {
+          "LogoConfigurationId": { "type": "tinyint", "readonly": true },
+          "Width": { "type": "smallint", "required": true },
+          "Height": { "type": "smallint", "required": true }
+        },
+        "known_values": [
+          { "LogoConfigurationId": 1, "Width": 255, "Height": 128 }
+        ]
+      },
+      "SponsorLevel": {
+        "description": "Livello/categoria sponsor per evento. I livelli cambiano da evento a evento — non sono un enum fisso.",
+        "table": "dbo.SponsorLevel",
+        "primary_key": "SponsorLevelId",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "sponsor_levels:evento:{EventoId}",
+          "ttl_seconds": 3600,
+          "invalidate_on": ["update"]
+        },
+        "fields": {
+          "SponsorLevelId": { "type": "tinyint", "readonly": true },
+          "EventoId": {
+            "type": "int",
+            "required": true,
+            "foreign_key": "Evento.EventoId",
+            "note": "Aggiunto in fase di migrazione per supporto multi-evento. TODO T16."
+          },
+          "Name": { "type": "string", "required": true },
+          "LogoConfigurationId": {
+            "type": "tinyint",
+            "foreign_key": "LogoConfiguration.LogoConfigurationId",
+            "note": "Usato nel Backoffice per dimensioni logo sponsor"
+          },
+          "SponsorLevelPriority": { "type": "int", "note": "Ordine di visualizzazione" }
+        },
+        "known_values_netcomm26": [
+          { "SponsorLevelId": 2, "Name": "Un evento di", "Priority": 5 },
+          { "SponsorLevelId": 3, "Name": "Main Partner", "Priority": 10 },
+          { "SponsorLevelId": 4, "Name": "Platinum Sponsor", "Priority": 15 },
+          { "SponsorLevelId": 34, "Name": "Diamond Sponsor", "Priority": 12 },
+          { "SponsorLevelId": 5, "Name": "Gold Sponsor", "Priority": 25 },
+          { "SponsorLevelId": 8, "Name": "Silver Sponsor", "Priority": 50 },
+          { "SponsorLevelId": 30, "Name": "Content Partner", "Priority": 40 },
+          { "SponsorLevelId": 15, "Name": "Media Partner", "Priority": 77 },
+          { "SponsorLevelId": 19, "Name": "Espositori", "Priority": 82 },
+          { "SponsorLevelId": 26, "Name": "Startup", "Priority": 95 }
+        ],
+        "note": "Netcomm_26 ha 35 livelli diversi. Ogni evento definisce i propri livelli."
+      },
+      "Sponsor": {
+        "description": "Azienda sponsor di un evento con utenza Backoffice",
+        "table": "dbo.Sponsor",
+        "primary_key": "SponsorId",
+        "source_table": "LiveForum.dbo.Sponsor",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "sponsor:{SponsorId}",
+          "ttl_seconds": 3600,
+          "invalidate_on": ["update"]
+        },
+        "fields": {
+          "SponsorId": { "type": "int", "readonly": true },
+          "EventoId": { "type": "int", "required": true, "foreign_key": "Evento.EventoId" },
+          "SponsorLevelId": { "type": "tinyint", "foreign_key": "SponsorLevel.SponsorLevelId" },
+          "Name": { "type": "string", "required": true },
+          "BusinessName": { "type": "string" },
+          "BusinessAddress": { "type": "string" },
+          "Address": { "type": "string" },
+          "ZipCode": { "type": "string" },
+          "City": { "type": "string" },
+          "Province": { "type": "string" },
+          "Country": { "type": "string" },
+          "Website": { "type": "string" },
+          "Email": { "type": "string" },
+          "Phone": { "type": "string" },
+          "VatNumber": { "type": "string", "required": true, "note": "Partita IVA" },
+          "DomainEmail": { "type": "string", "note": "Domini email per riconoscimento automatico utenti sponsor" },
+          "ReferrerName": { "type": "string" },
+          "ReferrerEmail": { "type": "string" },
+          "Url": { "type": "string", "note": "Logo URL" },
+          "Online": { "type": "bool" },
+          "Enabled": { "type": "bool" },
+          "Priority": { "type": "int" },
+          "StandPosition": { "type": "string" },
+          "MetriQuadri": { "type": "string" },
+          "AllestimentoStand": { "type": "string" },
+          "UrlFacebook": { "type": "string" },
+          "UrlLinkedn": { "type": "string" },
+          "UrlTwitter": { "type": "string", "note": "Rinominare in UrlX in futuro" },
+          "UID": { "type": "guid", "unique": true },
+          "UsernameMico": { "type": "string", "note": "Credenziali sistema esterno MICO. TODO T14: verificare se ancora attivo." },
+          "PasswordMico": { "type": "string", "note": "Credenziali sistema esterno MICO." },
+          "DocumentPassword": { "type": "string", "note": "Password per documenti riservati sponsor. Usato nel codice." },
+          "PasswordConferenceHall": { "type": "string", "note": "Password sala conferenze virtuale. Usato nel codice." },
+          "MaxConferenceHall": { "type": "tinyint" },
+          "MaxEmployees": { "type": "tinyint" },
+          "MaxConnectionAllowed": { "type": "int" },
+          "UrlAddedContent": { "type": "string" },
+          "TigDataEventsId": { "type": "guid", "deprecated": true, "note": "SCARTATO" },
+          "TigDataEventsSponsorId": { "type": "guid", "deprecated": true, "note": "SCARTATO" }
+        },
+        "rules": [
+          {
+            "id": "SPO001",
+            "type": "visibility_constraint",
+            "description": "Uno Sponsor vede solo i propri Speaker, Exhibitor e InvitationCode",
+            "filter": "SponsorId = @CurrentSponsorId",
+            "applies_to": ["User", "UserInvitation", "PromotionCode"]
+          },
+          {
+            "id": "SPO002",
+            "type": "insert_constraint",
+            "description": "Uno Sponsor può registrare solo Speaker ed Exhibitor tramite UserInvitation",
+            "condition": "RoleId IN ('SPEAKER', 'EXHIBITOR')"
+          }
+        ],
+        "intents": {
+          "get_own_speakers": "Recupera i propri Speaker",
+          "get_own_exhibitors": "Recupera i propri Exhibitor",
+          "get_own_invitations": "Recupera invitation inviati con stato",
+          "get_invitation_stats": "Statistiche invitation: inviati, aperti, completati",
+          "register_speaker": "Registra un nuovo Speaker tramite UserInvitation",
+          "register_exhibitor": "Registra un nuovo Exhibitor tramite UserInvitation",
+          "generate_promotion_code": "Genera codici invito per Visitor"
+        }
+      },
+      "UserInvitation": {
+        "description": "Invito diretto per Speaker o Exhibitor. Gestito dallo Sponsor dal Backoffice. Sistema separato da PromotionCode.",
+        "table": "dbo.UserInvitation",
+        "primary_key": "UserInvitationId",
+        "cache_strategy": { "enabled": false, "comment": "Dato transazionale" },
+        "fields": {
+          "UserInvitationId": { "type": "int", "readonly": true },
+          "Firstname": { "type": "string" },
+          "Lastname": { "type": "string" },
+          "Email": { "type": "string", "required": true },
+          "OwnerUserId": { "type": "int", "required": true, "foreign_key": "User.UserId" },
+          "SponsorId": { "type": "int", "nullable": true, "foreign_key": "Sponsor.SponsorId" },
+          "RoleId": { "type": "int", "required": true, "foreign_key": "Role.RoleId", "note": "Tipicamente Exhibitor" },
+          "AssignedUserId": { "type": "int", "nullable": true, "foreign_key": "User.UserId", "note": "Valorizzato quando l'invitato accetta" },
+          "UID": { "type": "guid", "unique": true },
+          "CultureId": { "type": "int", "nullable": true },
+          "CustomData": { "type": "xml", "note": "TODO T12: convertire in JSON" },
+          "InviteSent": { "type": "datetime", "nullable": true }
+        },
+        "note": "Sistema distinto da PromotionCode. UserInvitation = Speaker/Exhibitor. PromotionCode = Visitor."
+      },
+      "PromotionCode": {
+        "description": "Codice invito per Visitor generato dallo Sponsor. Sistema distinto da UserInvitation.",
+        "table": "dbo.PromotionCode",
+        "primary_key": "IdPromotionCode",
+        "cache_strategy": { "enabled": false, "comment": "Dato transazionale" },
+        "fields": {
+          "IdPromotionCode": { "type": "int", "readonly": true },
+          "Code": { "type": "varchar(10)", "required": true, "unique": true },
+          "IdPromotionType": { "type": "tinyint", "foreign_key": "PromotionType.IdPromotionType" },
+          "SponsorId": { "type": "int", "nullable": true, "foreign_key": "Sponsor.SponsorId" },
+          "SectionId": { "type": "int" },
+          "EventScheduleId": { "type": "int", "nullable": true },
+          "DataValidita": { "type": "datetime", "nullable": true },
+          "ProductId": { "type": "int", "nullable": true },
+          "IdPromotionCodeOrder": { "type": "int", "nullable": true, "foreign_key": "PromotionCodeOrder.IdPromotionCodeOrder" },
+          "Note": { "type": "string", "nullable": true }
+        },
+        "related_tables": {
+          "PromotionCodeOrder": "Ordine batch di codici da parte dello sponsor",
+          "UserInvitationCode": "Tracciamento invio del codice a una email specifica",
+          "PromotionCodeUsage": "Tracciamento utilizzo del codice"
+        },
+        "flow": "PromotionCodeOrder -> PromotionCode -> UserInvitationCode -> PromotionCodeUsage"
+      },
+      "PromotionType": {
+        "description": "Tipi di promotion code con relativi accessi",
+        "table": "dbo.PromotionType",
+        "primary_key": "IdPromotionType",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "promotion_types",
+          "ttl_seconds": 86400
+        },
+        "fields": {
+          "IdPromotionType": { "type": "tinyint", "readonly": true },
+          "PromotionTypeName": { "type": "string", "required": true },
+          "SectionId": { "type": "int", "note": "TODO T01: verificare cosa rappresenta" },
+          "ProductId": { "type": "int", "external_system": "mTicket" },
+          "ProductIdAfterEvent": { "type": "int", "note": "TODO T02: probabilmente per acquisto video post-evento", "external_system": "mTicket" }
+        },
+        "known_values": [
+          { "IdPromotionType": 1, "PromotionTypeName": "Invitation code", "days_access": 1, "discount_percent": 100 },
+          { "IdPromotionType": 3, "PromotionTypeName": "IC multiuso", "days_access": 2, "discount_percent": 100 },
+          { "IdPromotionType": 4, "PromotionTypeName": "Sconto 50", "days_access": 1, "discount_percent": 50 },
+          { "IdPromotionType": 5, "PromotionTypeName": "IC multiuso sconto 50", "days_access": 2, "discount_percent": 50 }
+        ]
+      },
+      "Workshop": {
+        "description": "Sessione, talk o workshop nell'agenda di un evento. Nel LiveForum si chiama Workshop — nome mantenuto nel nuovo schema.",
+        "table": "dbo.Workshop",
+        "primary_key": "WorkshopId",
+        "source_table": "LiveForum.dbo.Workshop",
+        "note": "Nel documento di analisi era chiamato Sessione. Il nome corretto nel DB è Workshop.",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "workshops:evento:{EventoId}",
+          "ttl_seconds": 7200,
+          "invalidate_on": ["update"]
+        },
+        "fields": {
+          "WorkshopId": { "type": "int", "readonly": true },
+          "SponsorId": { "type": "int", "nullable": true, "foreign_key": "Sponsor.SponsorId" },
+          "WorkshopTypeId": { "type": "tinyint", "foreign_key": "WorkshopType.WorkshopTypeId" },
+          "StartDate": { "type": "datetime" },
+          "EndDate": { "type": "datetime" },
+          "Online": { "type": "bool" },
+          "Enabled": { "type": "bool" },
+          "WorkshopHallId": { "type": "int", "nullable": true, "foreign_key": "WorkshopHall.WorkshopHallId" },
+          "HallCongress": { "type": "string", "note": "Nome sala come stringa libera" },
+          "NoReplay": { "type": "bool" },
+          "ChatPreModeration": { "type": "bool" },
+          "RecorderDisabled": { "type": "bool", "nullable": true },
+          "CultureId": { "type": "int", "nullable": true },
+          "UID": { "type": "guid", "unique": true },
+          "TigDataEventsId": { "type": "guid", "deprecated": true, "note": "SCARTATO" },
+          "Password": { "deprecated": true, "note": "SCARTATO: sempre NULL nei dati reali" }
+        },
+        "related_tables": {
+          "WorkshopText": "Titoli e descrizioni multilingua",
+          "WorkshopType": "Tipo workshop (Livestream, Conference, ecc.)",
+          "WorkshopHall": "Sala fisica o virtuale",
+          "WorkshopCategory": "Categorie associate",
+          "WorkshopSponsor": "Sponsor associati",
+          "WorkshopTag": "Tag associati",
+          "WorkshopUser": "Utenti associati con ruolo (Speaker, Moderatore)",
+          "WorkshopUserRole": "Ruoli possibili per utenti nel workshop"
+        },
+        "intents": {
+          "get_agenda": "Recupera agenda completa ordinata per orario",
+          "get_by_speaker": "Recupera workshop di uno Speaker specifico",
+          "get_with_speakers": "Recupera workshop con elenco relatori"
+        }
+      },
+      "Evento": {
+        "description": "Evento o edizione di un evento",
+        "table": "dbo.Evento",
+        "primary_key": "EventoId",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "evento:{EventoId}",
+          "ttl_strategy": "dynamic",
+          "invalidate_on": ["update"]
+        },
+        "fields": {
+          "EventoId": { "type": "int", "readonly": true },
+          "Nome": { "type": "string", "required": true },
+          "DataInizio": { "type": "datetime", "required": true },
+          "DataFine": { "type": "datetime", "required": true },
+          "NumeroGiorni": { "type": "int", "readonly": true, "computed": "DATEDIFF(DAY, DataInizio, DataFine) + 1" },
+          "Sede": { "type": "string" },
+          "MaxPartecipanti": { "type": "int", "nullable": true },
+          "Stato": {
+            "type": "enum",
+            "values": ["BOZZA", "PUBBLICATO", "CHIUSO", "ANNULLATO"],
+            "default": "BOZZA"
+          },
+          "RegistrazioniAperte": { "type": "bool", "default": false },
+          "IdFieraMTicket": {
+            "type": "int",
+            "nullable": true,
+            "note": "ID evento sul sistema mTicket. Netcomm_26 = 229. Configurato in Web.config come IdFieraMTicket.",
+            "external_system": "mTicket"
+          }
+        },
+        "rules": [
+          {
+            "id": "EVT001",
+            "type": "date_constraint",
+            "description": "La data di fine deve essere successiva alla data di inizio",
+            "condition": "DataFine > DataInizio",
+            "error_message": "La data di fine deve essere successiva alla data di inizio"
+          },
+          {
+            "id": "EVT002",
+            "type": "state_machine",
+            "transitions": {
+              "BOZZA": ["PUBBLICATO", "ANNULLATO"],
+              "PUBBLICATO": ["CHIUSO", "ANNULLATO"],
+              "CHIUSO": [],
+              "ANNULLATO": []
+            }
+          },
+          {
+            "id": "EVT003",
+            "type": "delete_constraint",
+            "description": "Un evento non può essere eliminato se ha registrazioni",
+            "condition": "NOT EXISTS (SELECT 1 FROM Registrazione WHERE EventoId = @EventoId)",
+            "error_message": "Impossibile eliminare: esistono registrazioni associate"
+          }
+        ],
+        "intents": {
+          "get_active": "Recupera eventi con registrazioni aperte",
+          "get_with_stats": "Recupera evento con statistiche registrazioni",
+          "get_agenda": "Recupera agenda completa con workshop e relatori",
+          "publish": "Pubblica un evento",
+          "open_registrations": "Apre le registrazioni dal frontend",
+          "close_registrations": "Chiude le registrazioni"
+        }
+      },
+      "Order": {
+        "description": "Ordine di acquisto biglietti. Sistema attivo e critico — usato da eForum, eForum2019, OnBoarding.",
+        "table": "dbo.Order",
+        "primary_key": "IdOrder",
+        "cache_strategy": { "enabled": false, "comment": "Dato transazionale critico, mai cachato" },
+        "fields": {
+          "IdOrder": { "type": "int", "readonly": true },
+          "Token": { "type": "guid", "unique": true },
+          "IdStatus": { "type": "int", "foreign_key": "OrderStatus.IDStatus" },
+          "IdTipoPagamento": {
+            "type": "int",
+            "note": "Enum inline senza tabella lookup: 0=Indefinito, 1=BancaSella, 2=Bonifico. Definito in codice come Order.TipoPagamento."
+          },
+          "Nome": { "type": "string" },
+          "Cognome": { "type": "string" },
+          "Email": { "type": "string" },
+          "TotalAmount": { "type": "money" },
+          "CodiceSconto": { "type": "string" },
+          "AuthorizationCode": { "type": "string" },
+          "BankTransactionId": { "type": "string" },
+          "ErrorCode": { "type": "string" },
+          "IntestazioneFattura": { "type": "string" },
+          "Indirizzo": { "type": "string" },
+          "CAP": { "type": "string" },
+          "Citta": { "type": "string" },
+          "Provincia": { "type": "string" },
+          "Nazione": { "type": "string" },
+          "PIVA": { "type": "string" },
+          "Pec": { "type": "string" },
+          "CodiceDestinatario": { "type": "string" },
+          "UID": { "type": "guid", "nullable": true },
+          "Privacy": { "type": "bool" },
+          "PromotionCode": { "type": "string" },
+          "TicketTransactionNumber": { "type": "string", "note": "Riferimento transazione mTicket" },
+          "MailToSend": { "type": "bool", "note": "Flag per job di invio mail conferma. Stored procedure: Order_SetMailToSend." },
+          "MailSent": { "type": "bool", "note": "Flag conferma invio mail. Stored procedure: Order_SetMailSent, Order_SetMailSentError." },
+          "InvoiceUID": { "type": "guid", "nullable": true, "note": "Raccordo con sistema fatturazione elettronica esterno." },
+          "InvoiceErrors": { "type": "string", "nullable": true, "note": "Errori dal sistema fatturazione elettronica." },
+          "Culture": { "type": "string" }
+        },
+        "related_tables": {
+          "OrderDetail": "Dettaglio righe ordine con dati biglietti",
+          "OrderStatus": "Lookup stati ordine",
+          "OrdiniIvaNonPagata": "Vista/tabella per riconciliazione IVA"
+        },
+        "intents": {
+          "get_by_event": "Recupera ordini di un evento",
+          "get_pending_mail": "Recupera ordini con MailToSend = true per job invio",
+          "set_mail_sent": "Marca mail come inviata",
+          "get_invoice_errors": "Recupera ordini con errori fatturazione"
+        }
+      },
+      "Ticket": {
+        "description": "Biglietto assegnato a un utente. Integrazione con sistema mTicket.",
+        "table": "dbo.Ticket",
+        "primary_key": "UserId",
+        "source_data": "11.487 record in Netcomm_26",
+        "fields": {
+          "UserId": { "type": "int", "required": true, "foreign_key": "User.UserId" },
+          "TicketId": { "type": "int", "nullable": true },
+          "TicketTransactionNumber": { "type": "string", "note": "Riferimento transazione mTicket" },
+          "QRCode": { "type": "string" },
+          "DigitalOnly": { "type": "bool", "nullable": true },
+          "PlenariaOnly": { "type": "bool", "nullable": true }
+        },
+        "related_tables": {
+          "MTicketAudit": "Log scansioni badge (10.950 record in Netcomm_26)",
+          "mTicketProduct": "Tipi di prodotto mTicket (2 record)",
+          "TicketUpgrade": "Upgrade biglietto (2 record in Netcomm_26)",
+          "CodiciSconto": "Mapping ticket intero/scontato per evento. IdFiera = EventoId nel nuovo schema."
+        }
+      },
+      "AccessiBippiniToWorkshop": {
+        "description": "Log scansioni badge agli accessi dei workshop. 34.183 record in Netcomm_26.",
+        "table": "dbo.AccessiBippiniToWorkshop",
+        "primary_key": "Id",
+        "note": "Nel nuovo schema multi-evento aggiungere EventoId.",
+        "fields": {
+          "Id": { "type": "int", "readonly": true },
+          "strBarData": { "type": "string", "required": true, "note": "Barcode scansionato" },
+          "dtTimestamp": { "type": "datetime", "required": true },
+          "strSala": { "type": "string" },
+          "WorkshopId": { "type": "int", "required": true, "foreign_key": "Workshop.WorkshopId" },
+          "UserId": { "type": "int", "required": true, "foreign_key": "User.UserId" },
+          "processed": { "type": "bool" }
+        }
+      },
+      "ParticipantUserList": {
+        "description": "Snapshot partecipanti con dati completi per uso operativo durante evento. Esistono varianti: ParticipantUserList, ParticipantUserList4, ParticipantUserList5.",
+        "tables": ["dbo.ParticipantUserList", "dbo.ParticipantUserList4", "dbo.ParticipantUserList5"],
+        "source_data": "1.072 + 1.710 + 1.642 record, tutti 6-7 maggio 2026",
+        "note": "Motivo suffisso 4 e 5 non noto. TODO T19: verificare con team operativo.",
+        "fields": {
+          "Id": { "type": "int", "readonly": true },
+          "WorkshopId": { "type": "int", "foreign_key": "Workshop.WorkshopId" },
+          "ScanTime": { "type": "datetime" },
+          "UserId": { "type": "int", "foreign_key": "User.UserId" },
+          "FirstName": { "type": "string" },
+          "LastName": { "type": "string" },
+          "Email": { "type": "string" },
+          "Company": { "type": "string" },
+          "QRCode": { "type": "string" },
+          "PrivacyAccepted": { "type": "bool" }
+        }
+      },
+      "Registrazione": {
+        "description": "Registrazione di un utente a un evento",
+        "table": "dbo.Registrazione",
+        "primary_key": "RegistrazioneId",
+        "cache_strategy": {
+          "enabled": true,
+          "key_pattern": "reg_stats:evento:{EventoId}",
+          "ttl_strategy": "dynamic",
+          "comment": "Cachiamo solo le statistiche aggregate, non le singole registrazioni"
+        },
+        "fields": {
+          "RegistrazioneId": { "type": "int", "readonly": true },
+          "UserId": { "type": "int", "required": true, "foreign_key": "User.UserId" },
+          "EventoId": { "type": "int", "required": true, "foreign_key": "Evento.EventoId" },
+          "SponsorId": { "type": "int", "nullable": true, "foreign_key": "Sponsor.SponsorId" },
+          "InvitationCodeId": { "type": "int", "nullable": true, "foreign_key": "PromotionCode.IdPromotionCode" },
+          "GiornoAccesso": {
+            "type": "enum",
+            "values": ["GIORNO_1", "GIORNO_2", "ENTRAMBI"],
+            "required": true
+          },
+          "Canale": {
+            "type": "enum",
+            "values": ["FRONTEND", "BACKOFFICE", "INVITATION"]
+          },
+          "Stato": {
+            "type": "enum",
+            "values": ["ATTIVA", "CANCELLATA", "IN_ATTESA"],
+            "default": "ATTIVA"
+          },
+          "DataRegistrazione": { "type": "datetime", "readonly": true, "default": "NOW()" },
+          "QRCode": {
+            "type": "string",
+            "readonly": true,
+            "note": "TODO T13: attualmente su User, da spostare qui in futuro"
+          },
+          "CheckInEffettuato": { "type": "bool", "default": false },
+          "DataCheckIn": { "type": "datetime", "nullable": true }
+        },
+        "rules": [
+          {
+            "id": "REG001",
+            "type": "duplicate_constraint",
+            "description": "Un utente non può registrarsi due volte allo stesso evento",
+            "condition": "NOT EXISTS (SELECT 1 FROM Registrazione WHERE UserId = @UserId AND EventoId = @EventoId AND Stato != 'CANCELLATA')",
+            "error_message": "L'utente è già registrato a questo evento"
+          },
+          {
+            "id": "REG002",
+            "type": "capacity_constraint",
+            "description": "Verifica capienza solo se MaxPartecipanti è valorizzato",
+            "condition": "MaxPartecipanti IS NULL OR (SELECT COUNT(*) FROM Registrazione WHERE EventoId = @EventoId AND Stato = 'ATTIVA') < MaxPartecipanti",
+            "error_message": "Evento al completo"
+          },
+          {
+            "id": "REG003",
+            "type": "state_constraint",
+            "description": "Registrazioni frontend possibili solo se RegistrazioniAperte = true",
+            "condition": "Canale != 'FRONTEND' OR (SELECT RegistrazioniAperte FROM Evento WHERE EventoId = @EventoId) = true",
+            "error_message": "Le registrazioni per questo evento non sono aperte"
+          },
+          {
+            "id": "REG004",
+            "type": "insert_rule",
+            "description": "Il QRCode viene generato automaticamente",
+            "action": "SET QRCode = GENERATE_QRCODE(UserId, EventoId)"
+          }
+        ],
+        "intents": {
+          "register_visitor": "Registra un Visitor dal frontend con o senza invitation code",
+          "register_by_sponsor": "Registra Speaker o Exhibitor da Backoffice Sponsor",
+          "cancel": "Cancella una registrazione",
+          "checkin": "Effettua check-in tramite QRCode",
+          "get_by_event": "Recupera tutte le registrazioni di un evento",
+          "get_by_sponsor": "Recupera registrazioni generate da uno Sponsor",
+          "get_stats": "Statistiche aggregate con TTL dinamico basato su data evento"
+        }
+      },
+      "UserPhoto_legacy": {
+        "description": "Alias: vedi UserPhoto. Nel DB LiveForum la tabella si chiama UserPicture.",
+        "table": "dbo.UserPicture",
+        "note": "Mantenuto per retrocompatibilità"
+      }
+    },
+    "todo_list": {
+      "T01": { "description": "Verificare significato SectionId in PromotionType", "priority": "Media" },
+      "T02": { "description": "Confermare ProductIdAfterEvent — probabilmente per acquisto video post-evento", "priority": "Bassa" },
+      "T10": { "description": "Campagne Google Ads Netcomm 2026: verificare Customer ID account figlio MCC", "priority": "Alta" },
+      "T11": { "description": "Campagne Facebook Netcomm 2026: Enrico deve completare Data Use Checkup su app Meta 693451887484215", "priority": "Alta" },
+      "T12": { "description": "Aggiornare codice serializzazione CustomData da XML a JSON", "priority": "Media" },
+      "T13": { "description": "Spostare QRCode da User a Registrazione — verificare impatto nel codice applicativo", "priority": "Bassa" },
+      "T14": { "description": "Verificare cosa è il sistema MICO e se è ancora attivo", "priority": "Alta" },
+      "T15": { "description": "Valutare rimozione UserInvitationTag dal codice (tabella vuota, 0 record)", "priority": "Bassa" },
+      "T16": { "description": "Aggiungere EventoId a SponsorLevel per supporto multi-evento", "priority": "Alta" },
+      "T17": { "description": "Riabilitare TDE su LiveForum_Netcomm_26 su liveforum-sqlmi", "priority": "Alta", "status": "CHIUSO - eseguito 22/05/2026" },
+      "T18": { "description": "Mappare IdFieraMTicket (229) all'EventoId nel nuovo schema", "priority": "Alta" },
+      "T19": { "description": "Verificare con team operativo perché ParticipantUserList ha suffisso 4 e 5", "priority": "Bassa" },
+      "T20": { "description": "Verificare sistema MICO (vedi T14)", "priority": "Alta" }
+    }
+  }
+}
